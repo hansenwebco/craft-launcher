@@ -9,7 +9,6 @@ use std::sync::Arc;
 use artcraft_launcher_core::details::AppDetails;
 use artcraft_launcher_core::platform::pick_asset;
 use artcraft_launcher_core::protocol::Command;
-use artcraft_launcher_core::status::AppStatus;
 use egui::{Color32, CornerRadius, Id, Margin, Order, Rect, RichText, Sense, Stroke, Ui, emath::easing, pos2, vec2};
 
 use crate::app::LauncherUi;
@@ -23,11 +22,33 @@ const SHOT_ASPECT: f32 = 0.625;
 const PAD: f32 = theme::PAD;
 /// As tall as the name, headline, "Like …" and version lines beside it, so the icon fills the row.
 const ICON: f32 = 112.0;
+/// Compact header values once the page is scrolled: a single control-height row with a smaller
+/// wordmark and tighter vertical padding.
+const COMPACT_TITLE: f32 = 22.0;
+const COMPACT_PAD: f32 = 12.0;
+const COMPACT_STACK_BELOW: f32 = 572.0;
+const COMPACT_ACTION_WIDE_W: f32 = 240.0;
+const COMPACT_ACTION_NARROW_W: f32 = 204.0;
+/// Scroll distance (in points) considered at the very top of the body.
+const TOP_EPSILON: f32 = 0.5;
 /// The previous / next buttons over a picture.
 const ARROW: f32 = 36.0;
 const SLIDE_SECS: f32 = 0.22;
 /// The width of the main button and its menu in the page's top, when the page is wide.
 const ACTION_W: f32 = 300.0;
+
+/// Per-app scroll and layout metrics stored in egui's temporary memory so the hero minimizes first
+/// before the body content starts scrolling.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeroScroll {
+    reset_for_new_app: bool,
+    minimized: bool,
+    absorbing_glide: bool,
+    last_collapse: f32,
+    offset_y: f32,
+    expanded_h: f32,
+    body_h: f32,
+}
 
 /// A details picture, as the backend has sent it.
 pub(crate) enum Picture {
@@ -96,6 +117,16 @@ impl LauncherUi {
             self.detail_shown = Some(id.clone());
             self.detail_shot = 0;
             self.detail_zoom = false;
+            let scroll_key = Id::unique("details-hero-scroll").with(id.as_str());
+            ctx.data_mut(|d| {
+                let mut s = d.get_temp::<HeroScroll>(scroll_key).unwrap_or_default();
+                s.reset_for_new_app = true;
+                s.minimized = false;
+                s.absorbing_glide = false;
+                s.last_collapse = 0.0;
+                s.offset_y = 0.0;
+                d.insert_temp(scroll_key, s);
+            });
             let app = id.clone();
             self.request_pictures(&app);
         }
@@ -155,19 +186,99 @@ impl LauncherUi {
 
                 ui.set_min_size(panel.size());
                 ui.set_max_size(panel.size());
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                let scroll_key = Id::unique("details-hero-scroll").with(id);
+                let mut scroll_state = ctx.data_mut(|d| d.get_temp::<HeroScroll>(scroll_key)).unwrap_or_default();
+                if scroll_state.reset_for_new_app {
+                    scroll_state.minimized = false;
+                    scroll_state.absorbing_glide = false;
+                    scroll_state.last_collapse = 0.0;
+                    scroll_state.offset_y = 0.0;
+                }
+                let fallback_expanded_h = if wide { 266.0 } else { 308.0 };
+                let expanded_h = if scroll_state.expanded_h > 0.0 { scroll_state.expanded_h } else { fallback_expanded_h };
+                let max_scroll_expanded = (scroll_state.body_h + expanded_h - panel.height()).max(0.0);
+                let can_scroll = max_scroll_expanded > 1.0;
+                if !can_scroll {
+                    scroll_state.minimized = false;
+                    scroll_state.absorbing_glide = false;
+                }
+
+                let pointer_in_panel = !self.detail_zoom && self.dialog.is_none() && ui.rect_contains_pointer(panel);
+                let has_wheel_event = pointer_in_panel && ui.input(|i| i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })));
+                let wheel_y = if pointer_in_panel { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
+
+                let was_minimized = scroll_state.minimized;
+                let was_fully_collapsed = was_minimized && scroll_state.last_collapse >= 1.0 - 1e-3;
+                if !was_minimized {
+                    if can_scroll && wheel_y < 0.0 {
+                        // Minimize the hero bar first before scrolling any body content.
+                        scroll_state.minimized = true;
+                        scroll_state.absorbing_glide = true;
+                    }
+                } else if wheel_y > 0.0 && scroll_state.offset_y <= TOP_EPSILON {
+                    // Already at the very top of the body: scrolling up restores the full hero.
+                    scroll_state.minimized = false;
+                    scroll_state.absorbing_glide = false;
+                } else if !was_fully_collapsed {
+                    if wheel_y < 0.0 {
+                        scroll_state.absorbing_glide = true;
+                    }
+                } else if (has_wheel_event && wheel_y < 0.0) || wheel_y >= -0.05 {
+                    scroll_state.absorbing_glide = false;
+                }
+
+                let slide = if self.reduce_motion || scroll_state.reset_for_new_app { 0.0 } else { SLIDE_SECS };
+                let collapse = ctx.animate_bool_with_time_and_easing(
+                    Id::unique("details-hero-compact").with(id),
+                    scroll_state.minimized,
+                    slide,
+                    easing::cubic_out,
+                );
+                scroll_state.last_collapse = collapse;
+
+                let (hero_rect, measured_expanded_h) =
+                    self.details_hero(ui, &entry, details, t, (previous.as_deref(), next.as_deref()), wide, collapse, k);
+                scroll_state.expanded_h = measured_expanded_h;
+                let expanded_h = measured_expanded_h;
+
+                let lock_content_at_top = !scroll_state.minimized || collapse < 1.0 - 1e-3 || scroll_state.absorbing_glide;
+                let wheel_over_hero = !lock_content_at_top && can_scroll && wheel_y != 0.0 && ui.rect_contains_pointer(hero_rect);
+                if (lock_content_at_top && wheel_y != 0.0) || wheel_over_hero {
+                    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+                }
+
+                let body_viewport_h = (panel.height() - hero_rect.height()).max(0.0);
                 // A bar that stays on screen says there is more below the fold; in the app's colour.
                 let page_visuals = crate::sheet::accent_scroll(ui, t, t.app_ink(entry.app));
                 // One scroll position per app, so the next app opens at its top.
-                egui::ScrollArea::vertical().id_salt(("details-scroll", id.to_string())).auto_shrink([false, false]).show(ui, |ui| {
+                let mut scroll_area =
+                    egui::ScrollArea::vertical().id_salt(("details-scroll", id.to_string())).max_height(body_viewport_h).auto_shrink([false, false]);
+                if scroll_state.reset_for_new_app || lock_content_at_top {
+                    scroll_area = scroll_area.vertical_scroll_offset(0.0);
+                } else if wheel_over_hero {
+                    scroll_area = scroll_area.vertical_scroll_offset((scroll_state.offset_y - wheel_y).max(0.0));
+                }
+                let scroll_out = scroll_area.show(ui, |ui| {
                     // The bar's colours are for the bar alone.
                     *ui.visuals_mut() = page_visuals;
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    self.details_hero(ui, &entry, details, t, (previous.as_deref(), next.as_deref()), wide);
-                    egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
+                    let body_frame = egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
                         self.details_body(ui, &entry, details, wide, t);
                     });
+                    let body_h = body_frame.response.rect.height();
+                    scroll_state.body_h = body_h;
+                    let min_scroll = max_scroll_expanded.min(32.0);
+                    let needed_body_h = body_viewport_h + min_scroll;
+                    if (scroll_state.minimized || collapse > 0.0) && body_h < needed_body_h {
+                        ui.add_space((needed_body_h - body_h).min((expanded_h - hero_rect.height()).max(0.0)));
+                    }
                 });
+                scroll_state.offset_y = if lock_content_at_top { 0.0 } else { scroll_out.state.clamped_offset().y.max(0.0) };
+                scroll_state.reset_for_new_app = false;
+                ctx.data_mut(|d| d.insert_temp(scroll_key, scroll_state));
             });
     }
 
@@ -302,84 +413,178 @@ impl LauncherUi {
     }
 
     /// The drawer's top: a wash of the app's colour under a 2 px rule, the close button, the name,
-    /// version and main button, and the app's links.
-    fn details_hero(&mut self, ui: &mut Ui, entry: &AppEntry, details: &AppDetails, t: &Tokens, around: (Option<&str>, Option<&str>), wide: bool) {
+    /// version and main button, and the app's links. Once the body scrolls, it smoothly collapses
+    /// into a compact sticky bar — gliding the icon, wordmark, primary action (`Open` / `Install`
+    /// and `⋯`) and `< > ×` buttons from their expanded positions into the compact row while fading
+    /// out the secondary copy and external links. Returns `(hero_rect, expanded_h)`.
+    #[allow(clippy::too_many_arguments)]
+    fn details_hero(
+        &mut self,
+        ui: &mut Ui,
+        entry: &AppEntry,
+        details: &AppDetails,
+        t: &Tokens,
+        around: (Option<&str>, Option<&str>),
+        wide: bool,
+        collapse: f32,
+        drawer_opacity: f32,
+    ) -> (Rect, f32) {
         let app = entry.app;
         let app_color = rgb(app.color);
         let status = entry.status(self.platform, self.caps.manage_apps);
-        let hero = egui::Frame::new().fill(tint(app_color, if t.dark { 0.09 } else { 0.07 })).inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+        let top_left = ui.cursor().min;
+        let full_w = ui.available_width();
+        let inner_left = top_left.x + PAD;
+        let inner_right = (top_left.x + full_w - PAD).max(inner_left + 1.0);
+        let inner_w = inner_right - inner_left;
+        let compact_stack = full_w < COMPACT_STACK_BELOW;
+
+        let has_icon = crate::icons::app(app.id).is_some();
+        let icon_advance = if has_icon { ICON + 16.0 } else { 0.0 };
+        let text_w = if wide { (inner_w - icon_advance - ACTION_W - 24.0).max(200.0) } else { (inner_w - icon_advance).max(40.0) };
+
+        let wordmark_exp_h = ui.fonts_mut(|f| f.row_height(&egui::FontId::new(theme::PAGE_TITLE, theme::display())));
+        let wordmark_cmp_h = ui.fonts_mut(|f| f.row_height(&egui::FontId::new(COMPACT_TITLE, theme::display())));
+        let headline_h = ui.painter().layout(details.headline.to_string(), egui::FontId::proportional(15.0), t.ink, text_w).size().y;
+        let version = crate::views::version_line(entry, &status);
+        let has_version = !version.trim().is_empty();
+        let version_h = if has_version { 5.0 + ui.fonts_mut(|f| f.row_height(&egui::FontId::proportional(12.5))) } else { 0.0 };
+        let text_block_h = wordmark_exp_h + 5.0 + headline_h + version_h;
+        let identity_h = if has_icon { ICON.max(text_block_h) } else { text_block_h };
+
+        // Expanded (collapse = 0.0) geometry.
+        let row1_top = top_left.y + PAD;
+        let row2_top = row1_top + theme::CONTROL_H + 8.0;
+        let after_identity_y = row2_top + identity_h + 30.0;
+        let exp_links_top = if wide { after_identity_y } else { after_identity_y + theme::CONTROL_H + 8.0 };
+        let expanded_h = (exp_links_top - top_left.y) + theme::CONTROL_H + PAD;
+
+        let nav_count = 1 + usize::from(around.0.is_some()) + usize::from(around.1.is_some());
+        let item_gap = ui.spacing().item_spacing.x;
+        let nav_w = nav_count as f32 * theme::CONTROL_H + nav_count.saturating_sub(1) as f32 * item_gap;
+
+        let exp_nav_rect = Rect::from_min_size(pos2(inner_right - nav_w, row1_top), vec2(nav_w, theme::CONTROL_H));
+        let exp_icon_rect = Rect::from_min_size(pos2(inner_left, row2_top), vec2(ICON, ICON));
+        let exp_wordmark_pos = pos2(inner_left + icon_advance, row2_top);
+        let exp_action_rect = if wide {
+            Rect::from_min_size(pos2(inner_right - ACTION_W, row2_top + (identity_h - theme::CONTROL_H) * 0.5), vec2(ACTION_W, theme::CONTROL_H))
+        } else {
+            Rect::from_min_size(pos2(inner_left, after_identity_y), vec2(inner_w, theme::CONTROL_H))
+        };
+
+        // Compact (collapse = 1.0) geometry.
+        let cmp_row1_top = top_left.y + COMPACT_PAD;
+        let compact_h = if compact_stack { 2.0 * COMPACT_PAD + 2.0 * theme::CONTROL_H + 8.0 } else { 2.0 * COMPACT_PAD + theme::CONTROL_H };
+        let cmp_nav_rect = Rect::from_min_size(pos2(inner_right - nav_w, cmp_row1_top), vec2(nav_w, theme::CONTROL_H));
+        let cmp_icon_rect = Rect::from_min_size(pos2(inner_left, cmp_row1_top), vec2(theme::CONTROL_H, theme::CONTROL_H));
+        let cmp_icon_advance = if has_icon { theme::CONTROL_H + 12.0 } else { 0.0 };
+        let cmp_wordmark_pos = pos2(inner_left + cmp_icon_advance, cmp_row1_top + (theme::CONTROL_H - wordmark_cmp_h) * 0.5);
+        let cmp_action_w = if wide { COMPACT_ACTION_WIDE_W } else { COMPACT_ACTION_NARROW_W };
+        let cmp_action_rect = if compact_stack {
+            Rect::from_min_size(pos2(inner_left, cmp_row1_top + theme::CONTROL_H + 8.0), vec2(inner_w, theme::CONTROL_H))
+        } else {
+            let action_right = cmp_nav_rect.left() - 17.0;
+            Rect::from_min_size(pos2(action_right - cmp_action_w, cmp_row1_top), vec2(cmp_action_w, theme::CONTROL_H))
+        };
+
+        // Interpolate every shared element between expanded and compact.
+        let lerp_rect = |a: Rect, b: Rect| Rect::from_min_max(a.min.lerp(b.min, collapse), a.max.lerp(b.max, collapse));
+        let hero_h = egui::lerp(expanded_h..=compact_h, collapse);
+        let nav_rect = lerp_rect(exp_nav_rect, cmp_nav_rect);
+        let icon_rect = lerp_rect(exp_icon_rect, cmp_icon_rect);
+        let action_rect = lerp_rect(exp_action_rect, cmp_action_rect);
+        let wordmark_pos = exp_wordmark_pos.lerp(cmp_wordmark_pos, collapse);
+        let title_s = egui::lerp(theme::PAGE_TITLE..=COMPACT_TITLE, collapse);
+        let fade = (1.0 - collapse * 1.8).clamp(0.0, 1.0);
+        let base_opacity = drawer_opacity.clamp(0.0, 1.0);
+
+        let (hero_rect, _) = ui.allocate_exact_size(vec2(full_w, hero_h), Sense::hover());
+        ui.painter().rect_filled(hero_rect, CornerRadius::ZERO, tint(app_color, if t.dark { 0.09 } else { 0.07 }));
+
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hero_rect));
+        child.set_clip_rect(hero_rect.intersect(ui.clip_rect()));
+
+        if fade > 0.0 {
+            let hud_w = (exp_nav_rect.left() - inner_left - 8.0).max(0.0);
+            let hud_rect = Rect::from_min_size(pos2(inner_left, row1_top), vec2(hud_w, theme::CONTROL_H));
+            child.scope_builder(egui::UiBuilder::new().max_rect(hud_rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.set_opacity(base_opacity * fade);
                 widgets::hud(ui, tl!("App details"), t.faint);
-                self.hero_top_row(ui, around, t);
             });
-            self.hero_identity(ui, entry, details, &status, t, wide);
-            ui.add_space(14.0);
-            // The menu leaves out the links: they are the buttons right below.
-            if !wide {
-                let row_w = ui.available_width();
-                ui.horizontal(|ui| self.actions_in(ui, entry, &status, row_w, false));
-            }
-            link_buttons(ui, app);
-        });
-        let r = hero.response.rect;
-        ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width(), 2.0)), CornerRadius::ZERO, app_color);
-        ui.painter().hline(r.x_range(), r.bottom() - 0.5, t.hairline());
-    }
+        }
 
-    /// The close button and the previous / next pair, right-aligned in the hero's top row.
-    fn hero_top_row(&mut self, ui: &mut Ui, around: (Option<&str>, Option<&str>), t: &Tokens) {
-        // Right to left: next, then previous, so they read as a pair before the close.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if widgets::glyph_button(ui, Glyph::Close, tl!("Close (Esc)")).clicked() {
-                self.detail = None;
-            }
-            if let (_, Some(next)) = around
-                && step_button(ui, false, tl!("Next app"), t)
-            {
-                self.detail = Some(next.to_string());
-            }
-            if let (Some(previous), _) = around
-                && step_button(ui, true, tl!("Previous app"), t)
-            {
-                self.detail = Some(previous.to_string());
-            }
+        child.scope_builder(egui::UiBuilder::new().max_rect(nav_rect).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            self.hero_nav_buttons(ui, around, t);
         });
-    }
 
-    /// The icon, name, headline and version line, with the main action button beside them when
-    /// the page is wide.
-    fn hero_identity(&mut self, ui: &mut Ui, entry: &AppEntry, details: &AppDetails, status: &AppStatus, t: &Tokens, wide: bool) {
-        let app = entry.app;
-        let hero_w = ui.available_width();
-        ui.horizontal(|ui| {
-            if let Some(icon) = crate::icons::app(app.id) {
+        if let Some(icon) = crate::icons::app(app.id) {
+            child.scope_builder(egui::UiBuilder::new().max_rect(icon_rect), |ui| {
                 // Decorative: the wordmark beside it carries the app name.
-                ui.add(egui::Image::new(icon).fit_to_exact_size(vec2(ICON, ICON)));
-            }
-            ui.add_space(8.0);
-            // Beside the buttons when the page is wide: the text keeps what they leave.
-            let text_w = if wide { (hero_w - ICON - 16.0 - ACTION_W - 24.0).max(200.0) } else { (hero_w - ICON - 16.0).max(40.0) };
-            ui.vertical(|ui| {
+                ui.add(egui::Image::new(icon).fit_to_exact_size(icon_rect.size()));
+            });
+        }
+
+        let wordmark_right_limit = if compact_stack { nav_rect.left() - 8.0 } else { action_rect.left() - 12.0 };
+        let wordmark_w = (wordmark_right_limit - wordmark_pos.x).max(40.0);
+        let wordmark_rect = Rect::from_min_size(wordmark_pos, vec2(wordmark_w, wordmark_exp_h));
+        let wordmark_bottom = child
+            .scope_builder(egui::UiBuilder::new().max_rect(wordmark_rect).layout(egui::Layout::left_to_right(egui::Align::Min)), |ui| {
+                widgets::wordmark(ui, app, title_s).rect.bottom()
+            })
+            .inner;
+
+        if fade > 0.0 {
+            let copy_top = wordmark_bottom + 5.0;
+            let copy_rect = Rect::from_min_size(pos2(wordmark_pos.x, copy_top), vec2(text_w, headline_h + version_h + 8.0));
+            child.scope_builder(egui::UiBuilder::new().max_rect(copy_rect).layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+                ui.set_opacity(base_opacity * fade);
                 ui.set_width(text_w);
                 ui.spacing_mut().item_spacing.y = 5.0;
-                widgets::wordmark(ui, app, theme::PAGE_TITLE);
                 ui.add(egui::Label::new(RichText::new(details.headline).size(15.0).color(t.ink)).wrap());
-                // "Version 0.5.0 · Oct 8, 2026", or the installed-versus-latest line.
-                let version = crate::views::version_line(entry, status);
-                if !version.trim().is_empty() {
+                if has_version {
                     ui.label(RichText::new(version).size(12.5).color(t.muted));
                 }
             });
-            if wide {
-                // The main button and its menu, at the right, level with the name.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.allocate_ui_with_layout(vec2(ACTION_W, theme::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        self.actions_in(ui, entry, status, ACTION_W, false);
-                    });
-                });
-            }
+        }
+
+        if !compact_stack && collapse > 0.0 {
+            let rule_x = nav_rect.left() - 8.5;
+            child.painter().vline(rule_x, nav_rect.y_range(), Stroke::new(1.0, t.line.gamma_multiply(collapse)));
+        }
+
+        child.scope_builder(egui::UiBuilder::new().max_rect(action_rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+            self.actions_in(ui, entry, &status, action_rect.width(), false);
         });
+
+        if fade > 0.0 {
+            let links_shift_y = (wordmark_pos.y - exp_wordmark_pos.y) * 0.5;
+            let links_rect = Rect::from_min_size(pos2(inner_left, exp_links_top + links_shift_y), vec2(inner_w, theme::CONTROL_H));
+            child.scope_builder(egui::UiBuilder::new().max_rect(links_rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.set_opacity(base_opacity * fade);
+                link_buttons(ui, app);
+            });
+        }
+
+        ui.painter().rect_filled(Rect::from_min_size(hero_rect.min, vec2(hero_rect.width(), 2.0)), CornerRadius::ZERO, app_color);
+        ui.painter().hline(hero_rect.x_range(), hero_rect.bottom() - 0.5, t.hairline());
+        (hero_rect, expanded_h)
+    }
+
+    /// Close, next app and previous app, laid out right-to-left so they read `< > ×`.
+    fn hero_nav_buttons(&mut self, ui: &mut Ui, around: (Option<&str>, Option<&str>), t: &Tokens) {
+        if widgets::glyph_button(ui, Glyph::Close, tl!("Close (Esc)")).clicked() {
+            self.detail = None;
+        }
+        if let (_, Some(next)) = around
+            && step_button(ui, false, tl!("Next app"), t)
+        {
+            self.detail = Some(next.to_string());
+        }
+        if let (Some(previous), _) = around
+            && step_button(ui, true, tl!("Previous app"), t)
+        {
+            self.detail = Some(previous.to_string());
+        }
     }
 
     /// The facts of the latest release in cells, then its notes.

@@ -2608,4 +2608,33 @@ fn scrolling_an_apps_page_compacts_the_hero_and_keeps_navigation_and_actions_vis
     h.run_steps(45);
     assert!(h.query_by_label("Website ↗").is_some(), "scrolling back to top restores external links");
     assert!(h.query_all_by_label_contains(headline).count() >= 2, "scrolling back to top restores the headline");
+
+    // Dragging the scroll bar thumb down and back up with the mouse smoothly collapses the hero,
+    // scrolls the body, and restores the full hero at the top.
+    let bar_x = close_before.right() + 24.0 + 5.0;
+    let start_pos = egui::pos2(bar_x, 60.0);
+    h.hover_at(start_pos);
+    h.run_steps(2);
+    h.drag_at(start_pos);
+    h.run_steps(2);
+    for step in 1..=15 {
+        let y = 60.0 + (step as f32) * 20.0;
+        h.hover_at(egui::pos2(bar_x, y));
+        h.run_steps(2);
+    }
+    let lead_dragged_down = h.get_by_label("Enlarge picture").rect();
+    assert!(h.query_by_label("Website ↗").is_none(), "dragging the scroll bar down compacts the hero");
+    assert!(lead_dragged_down.top() < lead_after_minimize.top() - 40.0, "dragging the scroll bar down scrolls the body: {lead_dragged_down:?}");
+
+    for step in (0..15).rev() {
+        let y = 60.0 + (step as f32) * 20.0;
+        h.hover_at(egui::pos2(bar_x, y));
+        h.run_steps(2);
+    }
+    h.drop_at(start_pos);
+    h.run_steps(4);
+    let lead_dragged_up = h.get_by_label("Enlarge picture").rect();
+    assert!(h.query_by_label("Website ↗").is_some(), "dragging the scroll bar back to the top restores external links");
+    assert!(h.query_all_by_label_contains(headline).count() >= 2, "dragging the scroll bar back to the top restores the headline");
+    assert!((lead_dragged_up.top() - lead_before.top()).abs() < 2.0, "body returns to the top after dragging the scroll bar up: {lead_dragged_up:?}");
 }

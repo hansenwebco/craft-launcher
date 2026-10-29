@@ -37,16 +37,23 @@ const SLIDE_SECS: f32 = 0.22;
 /// The width of the main button and its menu in the page's top, when the page is wide.
 const ACTION_W: f32 = 300.0;
 
-/// Per-app scroll and layout metrics stored in egui's temporary memory so the hero minimizes first
-/// before the body content starts scrolling.
+/// Active mouse-wheel transition for the collapsible hero bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WheelHeroTarget {
+    #[default]
+    None,
+    Collapse,
+    Expand,
+}
+
+/// Per-app scroll and layout metrics stored in egui's temporary memory so the hero and scroll bar
+/// share one continuous scroll range.
 #[derive(Clone, Copy, Debug, Default)]
 struct HeroScroll {
     reset_for_new_app: bool,
-    minimized: bool,
-    absorbing_glide: bool,
+    wheel_target: WheelHeroTarget,
     last_collapse: f32,
     offset_y: f32,
-    expanded_h: f32,
     body_h: f32,
 }
 
@@ -121,8 +128,7 @@ impl LauncherUi {
             ctx.data_mut(|d| {
                 let mut s = d.get_temp::<HeroScroll>(scroll_key).unwrap_or_default();
                 s.reset_for_new_app = true;
-                s.minimized = false;
-                s.absorbing_glide = false;
+                s.wheel_target = WheelHeroTarget::None;
                 s.last_collapse = 0.0;
                 s.offset_y = 0.0;
                 d.insert_temp(scroll_key, s);
@@ -188,95 +194,137 @@ impl LauncherUi {
                 ui.set_max_size(panel.size());
                 ui.spacing_mut().item_spacing.y = 0.0;
 
+                // A bar that stays on screen says there is more below the fold; in the app's colour.
+                let page_visuals = crate::sheet::accent_scroll(ui, t, t.app_ink(entry.app));
+                let bar_space = ui.spacing().scroll.bar_inner_margin + ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin;
+                let hero_w = (panel.width() - bar_space).max(1.0);
+                let (expanded_h, compact_h) = self.hero_heights(ui, &entry, details, t, wide, hero_w);
+                let collapse_range = (expanded_h - compact_h).max(1.0);
+
                 let scroll_key = Id::unique("details-hero-scroll").with(id);
                 let mut scroll_state = ctx.data_mut(|d| d.get_temp::<HeroScroll>(scroll_key)).unwrap_or_default();
                 if scroll_state.reset_for_new_app {
-                    scroll_state.minimized = false;
-                    scroll_state.absorbing_glide = false;
+                    scroll_state.wheel_target = WheelHeroTarget::None;
                     scroll_state.last_collapse = 0.0;
                     scroll_state.offset_y = 0.0;
                 }
-                let fallback_expanded_h = if wide { 266.0 } else { 308.0 };
-                let expanded_h = if scroll_state.expanded_h > 0.0 { scroll_state.expanded_h } else { fallback_expanded_h };
-                let max_scroll_expanded = (scroll_state.body_h + expanded_h - panel.height()).max(0.0);
-                let can_scroll = max_scroll_expanded > 1.0;
+                let compact_viewport_h = (panel.height() - compact_h).max(0.0);
+                let raw_max_scroll = (expanded_h + scroll_state.body_h - panel.height()).max(0.0);
+                let can_scroll = raw_max_scroll > 1.0;
+                let max_scroll = if can_scroll { raw_max_scroll.max(collapse_range) } else { 0.0 };
                 if !can_scroll {
-                    scroll_state.minimized = false;
-                    scroll_state.absorbing_glide = false;
+                    scroll_state.wheel_target = WheelHeroTarget::None;
+                    scroll_state.last_collapse = 0.0;
+                    scroll_state.offset_y = 0.0;
                 }
 
                 let pointer_in_panel = !self.detail_zoom && self.dialog.is_none() && ui.rect_contains_pointer(panel);
+                let pointer_down = ui.input(|i| i.pointer.primary_down() || i.pointer.primary_pressed());
                 let has_wheel_event = pointer_in_panel && ui.input(|i| i.raw.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { .. })));
                 let wheel_y = if pointer_in_panel { ui.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
 
-                let was_minimized = scroll_state.minimized;
-                let was_fully_collapsed = was_minimized && scroll_state.last_collapse >= 1.0 - 1e-3;
-                if !was_minimized {
-                    if can_scroll && wheel_y < 0.0 {
-                        // Minimize the hero bar first before scrolling any body content.
-                        scroll_state.minimized = true;
-                        scroll_state.absorbing_glide = true;
+                let prev_target = scroll_state.wheel_target;
+                let prev_collapse = scroll_state.last_collapse;
+                if !can_scroll || (pointer_down && wheel_y == 0.0) {
+                    scroll_state.wheel_target = WheelHeroTarget::None;
+                } else {
+                    match prev_target {
+                        WheelHeroTarget::Collapse => {
+                            if wheel_y > 0.0 {
+                                scroll_state.wheel_target = WheelHeroTarget::Expand;
+                            } else if prev_collapse >= 1.0 - 1e-3 && ((has_wheel_event && wheel_y < 0.0) || wheel_y >= -0.05) {
+                                scroll_state.wheel_target = WheelHeroTarget::None;
+                            }
+                        }
+                        WheelHeroTarget::Expand => {
+                            if wheel_y < 0.0 {
+                                scroll_state.wheel_target = WheelHeroTarget::Collapse;
+                            } else if prev_collapse <= 1e-3 && ((has_wheel_event && wheel_y > 0.0) || wheel_y <= 0.05) {
+                                scroll_state.wheel_target = WheelHeroTarget::None;
+                            }
+                        }
+                        WheelHeroTarget::None => {
+                            if wheel_y < 0.0 && scroll_state.offset_y < collapse_range - TOP_EPSILON {
+                                scroll_state.wheel_target = WheelHeroTarget::Collapse;
+                            } else if wheel_y > 0.0
+                                && scroll_state.offset_y > TOP_EPSILON
+                                && scroll_state.offset_y - wheel_y <= collapse_range + TOP_EPSILON
+                            {
+                                scroll_state.wheel_target = WheelHeroTarget::Expand;
+                            }
+                        }
                     }
-                } else if wheel_y > 0.0 && scroll_state.offset_y <= TOP_EPSILON {
-                    // Already at the very top of the body: scrolling up restores the full hero.
-                    scroll_state.minimized = false;
-                    scroll_state.absorbing_glide = false;
-                } else if !was_fully_collapsed {
-                    if wheel_y < 0.0 {
-                        scroll_state.absorbing_glide = true;
-                    }
-                } else if (has_wheel_event && wheel_y < 0.0) || wheel_y >= -0.05 {
-                    scroll_state.absorbing_glide = false;
                 }
 
+                let anim_id = Id::unique("details-hero-compact").with(id);
                 let slide = if self.reduce_motion || scroll_state.reset_for_new_app { 0.0 } else { SLIDE_SECS };
-                let collapse = ctx.animate_bool_with_time_and_easing(
-                    Id::unique("details-hero-compact").with(id),
-                    scroll_state.minimized,
-                    slide,
-                    easing::cubic_out,
-                );
+                let lock_wheel = scroll_state.wheel_target != WheelHeroTarget::None;
+                let (effective_scroll_y, collapse) = match scroll_state.wheel_target {
+                    WheelHeroTarget::Collapse => {
+                        let c = ctx.animate_bool_with_time_and_easing(anim_id, true, slide, easing::cubic_out);
+                        (c * collapse_range, c)
+                    }
+                    WheelHeroTarget::Expand => {
+                        let c = ctx.animate_bool_with_time_and_easing(anim_id, false, slide, easing::cubic_out);
+                        (c * collapse_range, c)
+                    }
+                    WheelHeroTarget::None => {
+                        let y = if can_scroll { scroll_state.offset_y.clamp(0.0, max_scroll) } else { 0.0 };
+                        let c = if can_scroll { (y / collapse_range).clamp(0.0, 1.0) } else { 0.0 };
+                        let _ = ctx.animate_bool_with_time_and_easing(anim_id, c >= 0.5, 0.0, easing::cubic_out);
+                        (y, c)
+                    }
+                };
                 scroll_state.last_collapse = collapse;
+                let hero_h = egui::lerp(expanded_h..=compact_h, collapse);
 
-                let (hero_rect, measured_expanded_h) =
-                    self.details_hero(ui, &entry, details, t, (previous.as_deref(), next.as_deref()), wide, collapse, k);
-                scroll_state.expanded_h = measured_expanded_h;
-                let expanded_h = measured_expanded_h;
-
-                let lock_content_at_top = !scroll_state.minimized || collapse < 1.0 - 1e-3 || scroll_state.absorbing_glide;
-                let wheel_over_hero = !lock_content_at_top && can_scroll && wheel_y != 0.0 && ui.rect_contains_pointer(hero_rect);
-                if (lock_content_at_top && wheel_y != 0.0) || wheel_over_hero {
+                if lock_wheel && wheel_y != 0.0 {
                     ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
                 }
 
-                let body_viewport_h = (panel.height() - hero_rect.height()).max(0.0);
-                // A bar that stays on screen says there is more below the fold; in the app's colour.
-                let page_visuals = crate::sheet::accent_scroll(ui, t, t.app_ink(entry.app));
                 // One scroll position per app, so the next app opens at its top.
                 let mut scroll_area =
-                    egui::ScrollArea::vertical().id_salt(("details-scroll", id.to_string())).max_height(body_viewport_h).auto_shrink([false, false]);
-                if scroll_state.reset_for_new_app || lock_content_at_top {
-                    scroll_area = scroll_area.vertical_scroll_offset(0.0);
-                } else if wheel_over_hero {
-                    scroll_area = scroll_area.vertical_scroll_offset((scroll_state.offset_y - wheel_y).max(0.0));
+                    egui::ScrollArea::vertical().id_salt(("details-scroll", id.to_string())).max_height(panel.height()).auto_shrink([false, false]);
+                if scroll_state.reset_for_new_app || lock_wheel {
+                    scroll_area = scroll_area.vertical_scroll_offset(effective_scroll_y);
                 }
+                let body_visuals = page_visuals.clone();
                 let scroll_out = scroll_area.show(ui, |ui| {
                     // The bar's colours are for the bar alone.
-                    *ui.visuals_mut() = page_visuals;
+                    *ui.visuals_mut() = body_visuals;
                     ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    let body_frame = egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
-                        self.details_body(ui, &entry, details, wide, t);
-                    });
-                    let body_h = body_frame.response.rect.height();
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.allocate_exact_size(vec2(ui.available_width(), expanded_h), Sense::hover());
+                    let body_clip = ui.clip_rect().with_min_y(panel.top() + hero_h);
+                    let body_h = ui
+                        .scope_builder(egui::UiBuilder::new(), |ui| {
+                            ui.set_clip_rect(body_clip);
+                            ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 8.0;
+                            let body_frame = egui::Frame::new().inner_margin(Margin::same(PAD as i8)).show(ui, |ui| {
+                                self.details_body(ui, &entry, details, wide, t);
+                            });
+                            body_frame.response.rect.height()
+                        })
+                        .inner;
                     scroll_state.body_h = body_h;
-                    let min_scroll = max_scroll_expanded.min(32.0);
-                    let needed_body_h = body_viewport_h + min_scroll;
-                    if (scroll_state.minimized || collapse > 0.0) && body_h < needed_body_h {
-                        ui.add_space((needed_body_h - body_h).min((expanded_h - hero_rect.height()).max(0.0)));
+                    if can_scroll && body_h < compact_viewport_h {
+                        ui.add_space(compact_viewport_h - body_h);
                     }
                 });
-                scroll_state.offset_y = if lock_content_at_top { 0.0 } else { scroll_out.state.clamped_offset().y.max(0.0) };
+
+                *ui.visuals_mut() = page_visuals;
+                let hero_bounds = Rect::from_min_size(scroll_out.inner_rect.min, vec2(scroll_out.inner_rect.width(), hero_h));
+                let mut hero_ui = ui.new_child(egui::UiBuilder::new().max_rect(hero_bounds));
+                hero_ui.set_clip_rect(hero_bounds.intersect(ui.clip_rect()));
+                self.details_hero(&mut hero_ui, &entry, details, t, (previous.as_deref(), next.as_deref()), wide, collapse, k);
+                ui.painter().rect_stroke(panel, CornerRadius::ZERO, Stroke::new(1.0, t.line_strong), egui::StrokeKind::Inside);
+
+                let next_offset_y = if lock_wheel { effective_scroll_y } else { scroll_out.state.clamped_offset().y.max(0.0) };
+                if (next_offset_y - effective_scroll_y).abs() > 1e-3 {
+                    ctx.request_repaint();
+                }
+                scroll_state.offset_y = next_offset_y;
                 scroll_state.reset_for_new_app = false;
                 ctx.data_mut(|d| d.insert_temp(scroll_key, scroll_state));
             });
@@ -412,11 +460,37 @@ impl LauncherUi {
         });
     }
 
+    /// Computes `(expanded_h, compact_h)` for the details hero at width `full_w`.
+    fn hero_heights(&self, ui: &mut Ui, entry: &AppEntry, details: &AppDetails, t: &Tokens, wide: bool, full_w: f32) -> (f32, f32) {
+        let app = entry.app;
+        let status = entry.status(self.platform, self.caps.manage_apps);
+        let inner_w = (full_w - 2.0 * PAD).max(1.0);
+        let compact_stack = full_w < COMPACT_STACK_BELOW;
+
+        let has_icon = crate::icons::app(app.id).is_some();
+        let icon_advance = if has_icon { ICON + 16.0 } else { 0.0 };
+        let text_w = if wide { (inner_w - icon_advance - ACTION_W - 24.0).max(200.0) } else { (inner_w - icon_advance).max(40.0) };
+
+        let wordmark_exp_h = ui.fonts_mut(|f| f.row_height(&egui::FontId::new(theme::PAGE_TITLE, theme::display())));
+        let headline_h = ui.painter().layout(details.headline.to_string(), egui::FontId::proportional(15.0), t.ink, text_w).size().y;
+        let version = crate::views::version_line(entry, &status);
+        let has_version = !version.trim().is_empty();
+        let version_h = if has_version { 5.0 + ui.fonts_mut(|f| f.row_height(&egui::FontId::proportional(12.5))) } else { 0.0 };
+        let text_block_h = wordmark_exp_h + 5.0 + headline_h + version_h;
+        let identity_h = if has_icon { ICON.max(text_block_h) } else { text_block_h };
+
+        let after_identity_y = PAD + theme::CONTROL_H + 8.0 + identity_h + 30.0;
+        let exp_links_top = if wide { after_identity_y } else { after_identity_y + theme::CONTROL_H + 8.0 };
+        let expanded_h = exp_links_top + theme::CONTROL_H + PAD;
+        let compact_h = if compact_stack { 2.0 * COMPACT_PAD + 2.0 * theme::CONTROL_H + 8.0 } else { 2.0 * COMPACT_PAD + theme::CONTROL_H };
+        (expanded_h, compact_h)
+    }
+
     /// The drawer's top: a wash of the app's colour under a 2 px rule, the close button, the name,
     /// version and main button, and the app's links. Once the body scrolls, it smoothly collapses
     /// into a compact sticky bar — gliding the icon, wordmark, primary action (`Open` / `Install`
     /// and `⋯`) and `< > ×` buttons from their expanded positions into the compact row while fading
-    /// out the secondary copy and external links. Returns `(hero_rect, expanded_h)`.
+    /// out the secondary copy and external links.
     #[allow(clippy::too_many_arguments)]
     fn details_hero(
         &mut self,
@@ -428,7 +502,7 @@ impl LauncherUi {
         wide: bool,
         collapse: f32,
         drawer_opacity: f32,
-    ) -> (Rect, f32) {
+    ) {
         let app = entry.app;
         let app_color = rgb(app.color);
         let status = entry.status(self.platform, self.caps.manage_apps);
@@ -499,6 +573,7 @@ impl LauncherUi {
         let base_opacity = drawer_opacity.clamp(0.0, 1.0);
 
         let (hero_rect, _) = ui.allocate_exact_size(vec2(full_w, hero_h), Sense::hover());
+        ui.painter().rect_filled(hero_rect, CornerRadius::ZERO, t.bg);
         ui.painter().rect_filled(hero_rect, CornerRadius::ZERO, tint(app_color, if t.dark { 0.09 } else { 0.07 }));
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(hero_rect));
@@ -567,7 +642,6 @@ impl LauncherUi {
 
         ui.painter().rect_filled(Rect::from_min_size(hero_rect.min, vec2(hero_rect.width(), 2.0)), CornerRadius::ZERO, app_color);
         ui.painter().hline(hero_rect.x_range(), hero_rect.bottom() - 0.5, t.hairline());
-        (hero_rect, expanded_h)
     }
 
     /// Close, next app and previous app, laid out right-to-left so they read `< > ×`.
